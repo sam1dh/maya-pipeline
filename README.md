@@ -9,6 +9,7 @@ while the network is down; and catches up afterwards, so the cloud ends with eve
 - **Cloud:** FastAPI on Render (free web service) + Postgres on Neon (free plan). No paid services.
 - **One processing implementation** (`pipeline/processing.py`) is used by both the device and the cloud.
 
+![Architecture](docs/Architecture.png)
 Design note: [docs/DESIGN.md](docs/DESIGN.md) · Test evidence: [docs/EVIDENCE.md](docs/EVIDENCE.md)
 
 ## Repository layout
