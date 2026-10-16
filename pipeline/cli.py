@@ -1,11 +1,11 @@
 """The `pipeline` command: the device-side interface required by spec Section 4.
 
-  pipeline collect                              run the collector
-  pipeline process                              compute Section 3 results on the device (offline)
+  pipeline run                                  collector + processor + uploader together
+  pipeline collect / process                    run one part alone (for testing)
   pipeline status                               one JSON line: mode, samples saved, in cloud, backlog
   pipeline sessions                             one JSON line per session on the device
-  pipeline export --session ID --from device    samples as JSON lines, then one line per loss
-  pipeline results --session ID                 one JSON line per window and mode
+  pipeline export --session ID --from device|cloud
+  pipeline results --session ID [--from device|cloud]
 """
 import argparse
 import datetime
@@ -15,11 +15,16 @@ import os
 import sqlite3
 import struct
 import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
+from .config import ROOT, load_env
 from .storage import WIDTH
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_DB = os.environ.get("PIPELINE_DB", os.path.join(ROOT, "data", "device.db"))
+DEFAULT_DB = os.path.join(ROOT, "data", "device.db")
 LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
 
 
@@ -36,16 +41,71 @@ def read_meta(db):
 
 def resolve_session(db, wanted):
     if wanted:
-        if not db.execute("SELECT 1 FROM sessions WHERE session_id=?", (wanted,)).fetchone():
+        if db is not None and not db.execute("SELECT 1 FROM sessions WHERE session_id=?", (wanted,)).fetchone():
             sys.exit(f"pipeline: unknown session '{wanted}' (see: pipeline sessions)")
         return wanted
-    current = read_meta(db).get("current_session")
+    current = read_meta(db).get("current_session") if db is not None else None
     if not current:
-        sys.exit("pipeline: no session recorded yet")
+        sys.exit("pipeline: no session recorded yet (use --session ID)")
     return current
 
 
+def cloud_stream(path, session):
+    url, token = os.environ.get("CLOUD_URL"), os.environ.get("CLOUD_TOKEN")
+    if not url or not token:
+        sys.exit("pipeline: set CLOUD_URL and CLOUD_TOKEN in .env")
+    req = urllib.request.Request(f"{url.rstrip('/')}{path}?{urllib.parse.urlencode({'session': session})}",
+                                 headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            while True:
+                block = resp.read(1 << 16)
+                if not block:
+                    break
+                sys.stdout.buffer.write(block)
+    except urllib.error.URLError as e:
+        sys.exit(f"pipeline: cloud request failed: {e}")
+    sys.stdout.flush()
+    return 0
+
+
 # ---------------------------------------------------------------- commands
+def cmd_run(args):
+    from .collector import Collector
+    from .processor import Processor
+    from .storage import Storage
+    from .uploader import Uploader
+    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+    log = logging.getLogger("pipeline")
+    st = Storage(args.db)
+    with st.tx():
+        st.db.execute("INSERT OR REPLACE INTO meta VALUES ('mode', 'offline')")   # until the cloud answers
+    st.db.close()
+    workers = [("collector", lambda: Collector(args.host, args.port, Storage(args.db), args.poll).run()),
+               ("processor", lambda: Processor(args.db).run())]
+    url, token = os.environ.get("CLOUD_URL"), os.environ.get("CLOUD_TOKEN")
+    if url and token:
+        workers.append(("uploader", lambda: Uploader(args.db, url, token).run()))
+    else:
+        log.warning("CLOUD_URL / CLOUD_TOKEN not set: running offline only")
+
+    def guard(name, fn):
+        try:
+            fn()
+        except Exception:
+            logging.getLogger(name).exception("crashed; exiting so the service manager restarts the pipeline")
+            os._exit(1)
+
+    for name, fn in workers:
+        threading.Thread(target=guard, args=(name, fn), name=name, daemon=True).start()
+    log.info("pipeline running: %s", ", ".join(name for name, _ in workers))
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        log.info("stopped")
+
+
 def cmd_collect(args):
     from .collector import Collector
     from .storage import Storage
@@ -71,12 +131,10 @@ def cmd_status(args):
         print(json.dumps({"mode": "offline", "session": None, "samples_saved": 0,
                           "samples_in_cloud": 0, "backlog": 0, "samples_lost": 0}))
         return 0
-    db.execute("BEGIN")                       # one consistent snapshot while the collector writes
+    db.execute("BEGIN")                       # one consistent snapshot while the pipeline writes
     meta = read_meta(db)
-    watermark = int(meta.get("cloud_chunk_watermark", 0))   # set by the uploader (Phase 4)
     saved = db.execute("SELECT COALESCE(SUM(count), 0) FROM chunks").fetchone()[0]
-    in_cloud = db.execute("SELECT COALESCE(SUM(count), 0) FROM chunks WHERE id <= ?",
-                          (watermark,)).fetchone()[0]
+    in_cloud = int(meta.get("samples_in_cloud", 0))          # confirmed by the cloud
     lost = db.execute("SELECT COALESCE(SUM(to_index - from_index + 1), 0) FROM losses "
                       "WHERE to_index IS NOT NULL").fetchone()[0]
     db.execute("COMMIT")
@@ -104,12 +162,12 @@ def cmd_sessions(args):
 
 
 def cmd_export(args):
-    if args.source == "cloud":
-        sys.exit("pipeline: export --from cloud is not available yet (cloud side comes in Phase 4)")
     db = open_db(args.db)
+    sid = resolve_session(db, args.session)
+    if args.source == "cloud":
+        return cloud_stream("/export", sid)
     if db is None:
         sys.exit("pipeline: no device database yet")
-    sid = resolve_session(db, args.session)
     write = sys.stdout.write
     db.execute("BEGIN")                       # consistent snapshot
     for sensor in (1, 2):
@@ -131,14 +189,14 @@ def cmd_export(args):
 
 
 def cmd_results(args):
-    if args.source == "cloud":
-        sys.exit("pipeline: results --from cloud is not available yet (cloud side comes in Phase 4)")
     db = open_db(args.db)
+    sid = resolve_session(db, args.session)
+    if args.source == "cloud":
+        return cloud_stream("/results", sid)
     if db is None:
         sys.exit("pipeline: no device database yet")
-    sid = resolve_session(db, args.session)
     if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='results'").fetchone():
-        return 0                              # the processor has not run yet
+        return 0
     for (line,) in db.execute("SELECT result FROM results WHERE session_id=? ORDER BY win, mode", (sid,)):
         sys.stdout.write(line + "\n")
     return 0
@@ -147,34 +205,35 @@ def cmd_results(args):
 # ---------------------------------------------------------------- entry point
 def build_parser():
     ap = argparse.ArgumentParser(prog="pipeline", description="Never Lose a Heartbeat: device pipeline")
-    ap.add_argument("--db", default=DEFAULT_DB, help=f"device database (default: {DEFAULT_DB})")
+    ap.add_argument("--db", default=os.environ.get("PIPELINE_DB", DEFAULT_DB),
+                    help=f"device database (default: {DEFAULT_DB})")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("collect", help="read both sensors from the mock and store every sample")
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=7100)
-    p.add_argument("--poll", type=float, default=0.5)
-    p.set_defaults(func=cmd_collect)
+    for name, func, text in (("run", cmd_run, "collector + processor + uploader (the full pipeline)"),
+                             ("collect", cmd_collect, "only read the sensors and store every sample")):
+        p = sub.add_parser(name, help=text)
+        p.add_argument("--host", default="127.0.0.1")
+        p.add_argument("--port", type=int, default=7100)
+        p.add_argument("--poll", type=float, default=0.5)
+        p.set_defaults(func=func)
 
-    sub.add_parser("process", help="compute Section 3 results on the device (offline mode)") \
+    sub.add_parser("process", help="only compute Section 3 results on the device") \
         .set_defaults(func=cmd_process)
     sub.add_parser("status", help="mode, samples saved, in cloud, backlog (one JSON line)") \
         .set_defaults(func=cmd_status)
     sub.add_parser("sessions", help="list sessions on the device").set_defaults(func=cmd_sessions)
 
-    p = sub.add_parser("export", help="samples as JSON lines, then one line per loss")
-    p.add_argument("--session", help="session id (default: current session)")
-    p.add_argument("--from", dest="source", choices=["device", "cloud"], default="device")
-    p.set_defaults(func=cmd_export)
-
-    p = sub.add_parser("results", help="one JSON line per window and mode")
-    p.add_argument("--session", help="session id (default: current session)")
-    p.add_argument("--from", dest="source", choices=["device", "cloud"], default="device")
-    p.set_defaults(func=cmd_results)
+    for name, func, text in (("export", cmd_export, "samples as JSON lines, then one line per loss"),
+                             ("results", cmd_results, "one JSON line per window and mode")):
+        p = sub.add_parser(name, help=text)
+        p.add_argument("--session", help="session id (default: current session)")
+        p.add_argument("--from", dest="source", choices=["device", "cloud"], default="device")
+        p.set_defaults(func=func)
     return ap
 
 
 def main(argv=None):
+    load_env()
     args = build_parser().parse_args(argv)
     try:
         sys.exit(args.func(args) or 0)

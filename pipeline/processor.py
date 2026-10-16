@@ -8,7 +8,7 @@ from .processing import RATE, compute_window
 from .storage import WIDTH, Storage, unpack
 
 log = logging.getLogger("processor")
-
+REWIND_WINDOWS = 15   # on going offline, re-process recent windows the cloud may never have received
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS results (
     session_id TEXT NOT NULL,
@@ -49,6 +49,7 @@ class Processor:
         self.db.executescript(SCHEMA)
         self.poll, self.batch = poll, batch
         self.last_report = 0.0
+	self.was_online = False
 
     def finished_windows(self, sid, current):
         """How many windows of this session are final (their samples can never change)."""
@@ -61,6 +62,11 @@ class Processor:
     def step(self):
         meta = dict(self.db.execute("SELECT key, value FROM meta"))
         current, online = meta.get("current_session"), meta.get("mode") == "online"
+	if self.was_online and not online:
+            with self.st.tx():
+                self.db.execute("UPDATE progress SET next_window = MAX(0, next_window - ?)", (REWIND_WINDOWS,))
+            log.info("went offline: re-processing the last %d windows on the device", REWIND_WINDOWS)
+        self.was_online = online
         done = 0
         for (sid,) in self.db.execute("SELECT session_id FROM sessions ORDER BY first_seen").fetchall():
             row = self.db.execute("SELECT next_window FROM progress WHERE session_id=?", (sid,)).fetchone()
