@@ -10,6 +10,7 @@ while the network is down; and catches up afterwards, so the cloud ends with eve
 - **One processing implementation** (`pipeline/processing.py`) is used by both the device and the cloud.
 
 ![Architecture](docs/Architecture.png)
+
 Design note: [docs/DESIGN.md](docs/DESIGN.md) · Test evidence: [docs/EVIDENCE.md](docs/EVIDENCE.md)
 
 ## Repository layout

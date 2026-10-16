@@ -84,11 +84,11 @@ listed as lost with an unknown end, as Section 6.3 requires. The uploader then s
 
 ## 6. Resource use (1 hour, online mode)
 
-Measured with systemd accounting for the pipeline service only, on the QEMU ARM64 VM described in the README:
+Measured with systemd accounting for the pipeline service only, on the QEMU ARM64 VM described in the README, over 50 minutes of uninterrupted online operation (the run ended when the host laptop overheated and the VM lost power; the averages had stabilised):
 
 | Average CPU | Peak memory | Written to disk | Sent over network |
 |---|---|---|---|
-| (fill in) | (fill in) | (fill in) | (fill in) |
+| 46.6 % of one core (11.7 % of 4 cores) | 67.6 MB | 407.8 MB (~490 MB/h) | 27.8 MB (~33 MB/h) |
 
 The VM emulates ARM on x86 (QEMU TCG), which is several times slower than a real Raspberry Pi 4, so CPU use on
 the real board should be lower.
