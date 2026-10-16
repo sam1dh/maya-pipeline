@@ -1,0 +1,17 @@
+[Unit]
+Description=Never Lose a Heartbeat - device pipeline (collector + processor + uploader)
+After=network.target maya-mock.service
+
+[Service]
+WorkingDirectory=/root/maya-pipeline
+ExecStart=/usr/bin/python3 /root/maya-pipeline/bin/pipeline run
+Restart=always
+RestartSec=1
+Environment=PYTHONUNBUFFERED=1
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+IPAccounting=yes
+
+[Install]
+WantedBy=multi-user.target

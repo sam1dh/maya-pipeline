@@ -1,0 +1,15 @@
+[Unit]
+Description=Stand-in biosignal mock (replace with the official biosignal-mock when available)
+After=network.target
+
+[Service]
+WorkingDirectory=/root/maya-pipeline
+Environment=MOCK_MODE=signal
+EnvironmentFile=-/root/maya-pipeline/deploy/mock.env
+ExecStart=/usr/bin/python3 /root/maya-pipeline/tools/stand_in_mock.py --mode ${MOCK_MODE} --seed 7 --duration 86400 --port 7100
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+
