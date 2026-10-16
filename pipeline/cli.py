@@ -1,10 +1,11 @@
 """The `pipeline` command: the device-side interface required by spec Section 4.
 
   pipeline collect                              run the collector
+  pipeline process                              compute Section 3 results on the device (offline)
   pipeline status                               one JSON line: mode, samples saved, in cloud, backlog
   pipeline sessions                             one JSON line per session on the device
   pipeline export --session ID --from device    samples as JSON lines, then one line per loss
-  pipeline results --session ID                 per-window results (added in Phase 3)
+  pipeline results --session ID                 one JSON line per window and mode
 """
 import argparse
 import datetime
@@ -19,6 +20,7 @@ from .storage import WIDTH
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB = os.environ.get("PIPELINE_DB", os.path.join(ROOT, "data", "device.db"))
+LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
 
 
 def open_db(path):
@@ -47,11 +49,20 @@ def resolve_session(db, wanted):
 def cmd_collect(args):
     from .collector import Collector
     from .storage import Storage
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
     try:
         Collector(args.host, args.port, Storage(args.db), args.poll).run()
     except KeyboardInterrupt:
         logging.getLogger("collector").info("stopped")
+
+
+def cmd_process(args):
+    from .processor import Processor
+    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+    try:
+        Processor(args.db).run()
+    except KeyboardInterrupt:
+        logging.getLogger("processor").info("stopped")
 
 
 def cmd_status(args):
@@ -120,8 +131,17 @@ def cmd_export(args):
 
 
 def cmd_results(args):
-    print("pipeline: results are added in Phase 3", file=sys.stderr)
-    return 2
+    if args.source == "cloud":
+        sys.exit("pipeline: results --from cloud is not available yet (cloud side comes in Phase 4)")
+    db = open_db(args.db)
+    if db is None:
+        sys.exit("pipeline: no device database yet")
+    sid = resolve_session(db, args.session)
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='results'").fetchone():
+        return 0                              # the processor has not run yet
+    for (line,) in db.execute("SELECT result FROM results WHERE session_id=? ORDER BY win, mode", (sid,)):
+        sys.stdout.write(line + "\n")
+    return 0
 
 
 # ---------------------------------------------------------------- entry point
@@ -136,6 +156,8 @@ def build_parser():
     p.add_argument("--poll", type=float, default=0.5)
     p.set_defaults(func=cmd_collect)
 
+    sub.add_parser("process", help="compute Section 3 results on the device (offline mode)") \
+        .set_defaults(func=cmd_process)
     sub.add_parser("status", help="mode, samples saved, in cloud, backlog (one JSON line)") \
         .set_defaults(func=cmd_status)
     sub.add_parser("sessions", help="list sessions on the device").set_defaults(func=cmd_sessions)
@@ -145,8 +167,9 @@ def build_parser():
     p.add_argument("--from", dest="source", choices=["device", "cloud"], default="device")
     p.set_defaults(func=cmd_export)
 
-    p = sub.add_parser("results", help="per-window results (Phase 3)")
-    p.add_argument("--session")
+    p = sub.add_parser("results", help="one JSON line per window and mode")
+    p.add_argument("--session", help="session id (default: current session)")
+    p.add_argument("--from", dest="source", choices=["device", "cloud"], default="device")
     p.set_defaults(func=cmd_results)
     return ap
 
