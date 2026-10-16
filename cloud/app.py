@@ -115,7 +115,7 @@ class CloudSamples:
         self.cur.execute("SELECT first_index, n, data FROM chunks WHERE session_id=%s AND sensor=%s "
                          "AND first_index >= %s AND first_index < %s", (self.sid, sensor, lo - RATE, hi))
         for fi, n, data in self.cur.fetchall():
-            vals = struct.unpack(f"<{n * w}i", data)
+            vals = struct.unpack(f"<{n * w}i", zlib.decompress(data))
             for k in range(n):
                 if lo <= fi + k < hi:
                     out[fi + k - lo] = list(vals[k * w:(k + 1) * w])
@@ -207,7 +207,7 @@ def ingest(body: dict = Body(...), authorization: str = Header(default="")):
     global ingest_conn
     check(authorization)
     chunks = [(c["session"], c["sensor"], c["first_index"], c["count"],
-               zlib.decompress(base64.b64decode(c["data"]))) for c in body.get("chunks", [])]
+               base64.b64decode(c["data"])) for c in body.get("chunks", [])]
     losses = [(x["session"], x["sensor"], x["from_index"], x["to_index"], x["reason"])
               for x in body.get("losses", [])]
     results = [(r["session"], r["window"], json.dumps(r)) for r in body.get("results", [])]
@@ -231,7 +231,8 @@ def ingest(body: dict = Body(...), authorization: str = Header(default="")):
                     cur.executemany(
                         "INSERT INTO sessions (session_id, final_index) VALUES (%s, %s) "
                         "ON CONFLICT (session_id) DO UPDATE "
-                        "SET final_index = COALESCE(EXCLUDED.final_index, sessions.final_index)", sessions)
+                        "SET final_index = EXCLUDED.final_index "
+                        "WHERE EXCLUDED.final_index IS NOT NULL AND sessions.final_index IS DISTINCT FROM EXCLUDED.final_index", sessions)
                 if chunks:
                     cur.executemany("INSERT INTO chunks (session_id, sensor, first_index, n, data) "
                                     "VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", chunks)
@@ -282,7 +283,7 @@ def export(session: str, authorization: str = Header(default="")):
                     cur.execute("SELECT first_index, n, data FROM chunks WHERE session_id=%s AND sensor=%s "
                                 "ORDER BY first_index", (session, sensor))
                     for fi, n, data in cur:
-                        vals = struct.unpack(f"<{n * w}i", data)
+                        vals = struct.unpack(f"<{n * w}i", zlib.decompress(data))
                         yield "".join('{"sensor": %d, "index": %d, "values": [%s]}\n'
                                       % (sensor, fi + k, ", ".join(map(str, vals[k * w:(k + 1) * w])))
                                       for k in range(n))
